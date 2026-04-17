@@ -88,7 +88,8 @@ jobs:
           mkdir -p "${CLINIQ_BACKUP_VAULT_ROOT}"
           # Fast: only audit-cloudflare (no Firestore reads needed)
           # just to keep the docs/dr/latest-cloud-backup.json mirror fresh.
-          npm run dr:audit-cloudflare
+          # Non-fatal: token may lack Zone:Read; R2 sync is the critical part.
+          npm run dr:audit-cloudflare || echo "::warning::audit-cloudflare failed (token may lack Zone:Read); continuing"
 
       - name: Sync vault to R2
         working-directory: src
