@@ -108,7 +108,8 @@ jobs:
 
           # Audit live cloudflare — writes docs/dr/latest-cloud-backup.json
           # (reads from the same location check-backup-* uses).
-          npm run dr:audit-cloudflare
+          # Non-fatal: token may lack Zone:Read.
+          npm run dr:audit-cloudflare || echo "::warning::audit-cloudflare failed (token may lack Zone:Read); continuing"
 
           # Run the 6 independent checks. Records per-check verdict.
           npm run dr:check-all

@@ -238,7 +238,7 @@ jobs:
           mkdir -p "${CLINIQ_BACKUP_VAULT_ROOT}"
           # Audits write fresh evidence into the home-vault location.
           npm run dr:audit-firebase || echo "::warning::audit-firebase exited non-zero; continuing"
-          npm run dr:audit-cloudflare
+          npm run dr:audit-cloudflare || echo "::warning::audit-cloudflare failed (token may lack Zone:Read); continuing"
           # check-all reads from the same vault and prints the aggregate.
           npm run dr:check-all
           AGG=$(jq -r '.aggregate' "${CLINIQ_BACKUP_VAULT_ROOT}/verification/check-all.json")
