@@ -119,6 +119,20 @@ jobs:
             --arg result  "${RESULT}" \
             '{workflow:$workflow, runId:$runId, actor:$actor, event:$event, ts:$ts, result:$result}')"
 
+      - name: Notify Telegram on failure
+        if: always() && job.status != 'success' && env.TELEGRAM_BOT_TOKEN != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RESULT: ${{ job.status }}
+        run: |
+          set +e
+          MSG="🚨 Vault sync — ${RESULT}%0A%0AURL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "text=${MSG}" \
+            -d "parse_mode=HTML" >/dev/null || true
+
       - name: Scrub workspace
         if: always()
         run: rm -rf src "${RUNNER_TEMP}/dr-vault" || true
