@@ -98,6 +98,10 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_BACKUP_ENDPOINT: ${{ secrets.R2_BACKUP_ENDPOINT }}
+          R2_BACKUP_ACCESS_KEY_ID: ${{ secrets.R2_BACKUP_ACCESS_KEY_ID }}
+          R2_BACKUP_SECRET_ACCESS_KEY: ${{ secrets.R2_BACKUP_SECRET_ACCESS_KEY }}
+          R2_BACKUP_BUCKET_NAME: ${{ vars.R2_BACKUP_BUCKET_NAME }}
           CLINIQ_BACKUP_VAULT_ROOT: ${{ runner.temp }}/dr-vault
         run: npx tsx scripts/dr/sync-dr-vault-to-r2.ts --apply
 
