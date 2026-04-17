@@ -1,0 +1,23 @@
+# Dependencies (not used in this repo, but defense-in-depth)
+node_modules/
+.pnpm-store/
+
+# Env files — MUST NEVER be committed
+.env
+.env.*
+!.env.example
+
+# Local artifacts
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Cloned workspace scratch
+private/
+
+# Editor state
+.vscode/
+.idea/
+*.swp
+*.swo

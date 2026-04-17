@@ -1,0 +1,188 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Data Fortress — Scheduled Verification (dr:check-all)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Runs the full read-only verification pipeline daily at 06:00 UTC:
+#   1. audit-live-firebase        — inventory Firestore collections
+#   2. audit-live-cloudflare      — mirror R2 backup meta to docs/dr/
+#   3. check-all                  — 6 independent integrity checks
+#   4. sync-dr-vault-to-r2        — ship fresh evidence to R2
+#
+# This refreshes the admin dashboard's evidence so indicators like
+# "backup-coverage", "backup-freshness", "mirror-drift", etc. never
+# go stale past their 26h threshold.
+#
+# Designed to run independently of `backup.yml` — if backup fails, this
+# still runs and reports the degradation. If both run on the same day,
+# `dr-checks` picks up the fresh `firebase/meta/last-backup.json` that
+# `backup` just wrote.
+#
+# SAFETY profile identical to `backup.yml`:
+#   - schedule + workflow_dispatch only
+#   - contents:read permissions
+#   - SHA-pinned actions
+#   - secrets via env only
+#   - --ignore-scripts on npm ci
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: dr-checks
+
+on:
+  schedule:
+    # 06:00 UTC daily — 4h after `backup.yml` completes, so the evidence
+    # reflects the fresh backup rather than yesterday's state.
+    - cron: '0 6 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: dr-checks
+  cancel-in-progress: true    # A newer run supersedes any in-flight one
+
+permissions:
+  contents: read
+
+jobs:
+  check-all:
+    name: Verify all layers + sync vault
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout runner repo
+        uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29  # v4.1.1
+        with:
+          persist-credentials: false
+
+      - name: Clone private source
+        env:
+          CLONE_TOKEN: ${{ secrets.CLONE_TOKEN }}
+          SRC_REPO: ${{ vars.SRC_REPO }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CLONE_TOKEN:-}" ]]; then
+            echo "::error::CLONE_TOKEN secret is not configured"; exit 1
+          fi
+          git clone --depth=1 --no-tags \
+            "https://x-access-token:${CLONE_TOKEN}@github.com/${SRC_REPO}.git" \
+            src
+
+      - name: Setup Node 20
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.1
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: src/package-lock.json
+
+      - name: Install dependencies (no scripts)
+        working-directory: src
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run full verification pipeline
+        id: verify
+        working-directory: src
+        env:
+          FIREBASE_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+          FIREBASE_MIRROR_REGISTRY_JSON: ${{ secrets.FIREBASE_MIRROR_REGISTRY_JSON }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_BACKUP_ENDPOINT: ${{ secrets.R2_BACKUP_ENDPOINT }}
+          R2_BACKUP_ACCESS_KEY_ID: ${{ secrets.R2_BACKUP_ACCESS_KEY_ID }}
+          R2_BACKUP_SECRET_ACCESS_KEY: ${{ secrets.R2_BACKUP_SECRET_ACCESS_KEY }}
+          R2_BACKUP_BUCKET_NAME: ${{ vars.R2_BACKUP_BUCKET_NAME }}
+          CLINIQ_BACKUP_VAULT_ROOT: ${{ runner.temp }}/dr-vault
+        run: |
+          set -euo pipefail
+          mkdir -p "${CLINIQ_BACKUP_VAULT_ROOT}"
+
+          # Audit live firebase — writes firebase-live-inventory.json
+          # into the vault. Exit code 1 is acceptable (e.g. Cloud
+          # Functions diff) — downstream checks handle stale inputs
+          # explicitly.
+          npm run dr:audit-firebase || echo "::warning::dr:audit-firebase exit != 0 (non-fatal)"
+
+          # Audit live cloudflare — writes docs/dr/latest-cloud-backup.json
+          # (reads from the same location check-backup-* uses).
+          npm run dr:audit-cloudflare
+
+          # Run the 6 independent checks. Records per-check verdict.
+          npm run dr:check-all
+
+          AGG=$(jq -r '.aggregate' "${CLINIQ_BACKUP_VAULT_ROOT}/verification/check-all.json")
+          echo "aggregate=${AGG}" >> "$GITHUB_OUTPUT"
+
+          # Capture the per-check verdicts for the notification embed
+          {
+            echo 'summary<<EOF'
+            jq -r '.results[] | "- \(.id): \(.status)"' \
+              "${CLINIQ_BACKUP_VAULT_ROOT}/verification/check-all.json"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Aggregate: ${AGG}"
+          if [[ "${AGG}" == "fail" ]]; then
+            echo "::error::DR aggregate is FAIL — immediate attention required"
+            exit 1
+          fi
+          if [[ "${AGG}" == "warn" ]]; then
+            echo "::warning::DR aggregate is WARN — investigate when convenient"
+          fi
+
+      - name: Sync DR vault to R2
+        working-directory: src
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          CLINIQ_BACKUP_VAULT_ROOT: ${{ runner.temp }}/dr-vault
+        run: npx tsx scripts/dr/sync-dr-vault-to-r2.ts --apply
+
+      - name: Emit audit record
+        if: always()
+        env:
+          AGG: ${{ steps.verify.outputs.aggregate }}
+          RESULT: ${{ job.status }}
+        run: |
+          printf 'DR_AUDIT %s\n' "$(jq -nc \
+            --arg runId   "${{ github.run_id }}" \
+            --arg actor   "${{ github.actor }}" \
+            --arg event   "${{ github.event_name }}" \
+            --arg sha     "${{ github.sha }}" \
+            --arg ts      "$(date -u -Iseconds)" \
+            --arg workflow "dr-checks" \
+            --arg agg     "${AGG:-unknown}" \
+            --arg result  "${RESULT}" \
+            '{workflow:$workflow, runId:$runId, actor:$actor, event:$event, sha:$sha, ts:$ts, aggregate:$agg, result:$result}')"
+
+      - name: Scrub workspace
+        if: always()
+        run: rm -rf src "${RUNNER_TEMP}/dr-vault" || true
+
+      - name: Notify Discord on degradation
+        # Only fire on failure or warn — success is silent to reduce noise.
+        if: always() && (job.status != 'success' || steps.verify.outputs.aggregate == 'warn') && env.DISCORD_WEBHOOK_URL != ''
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          STATUS: ${{ job.status }}
+          AGG: ${{ steps.verify.outputs.aggregate }}
+          SUMMARY: ${{ steps.verify.outputs.summary }}
+        run: |
+          set +e
+          if [[ "${STATUS}" == "success" ]]; then
+            EMOJI="⚠️"; COLOR=16776960
+          else
+            EMOJI="🚨"; COLOR=15158332
+          fi
+          PAYLOAD=$(jq -nc \
+            --arg title "${EMOJI} DR checks — aggregate: ${AGG:-unknown}" \
+            --arg desc  "${SUMMARY}" \
+            --arg url   "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson color "${COLOR}" \
+            '{embeds:[{title:$title, description:$desc, url:$url, color:$color}]}')
+          curl -sS -H 'Content-Type: application/json' \
+            -d "${PAYLOAD}" \
+            "${DISCORD_WEBHOOK_URL}" >/dev/null || true

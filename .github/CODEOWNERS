@@ -1,0 +1,9 @@
+# Code owners for cliniq-dr-runner
+#
+# Every file in this repository requires review from the listed
+# owner(s) before any PR can merge. Combined with "Require pull
+# request reviews before merging" branch protection, this ensures
+# no workflow change (including from Dependabot) lands without
+# explicit human approval.
+
+*       @cliniqus

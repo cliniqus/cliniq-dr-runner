@@ -1,0 +1,32 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Dependabot — keep GitHub Actions SHA pins fresh.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Every action in our workflow YAML is pinned to a 40-char commit SHA
+# (immune to tag hijacking). Dependabot monitors the upstream repos and
+# opens a PR when a new release SHA is available, including the
+# release-notes diff for review.
+#
+# We gate merges through CODEOWNERS so that even a compromised
+# Dependabot GitHub App cannot auto-merge unreviewed changes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: sunday
+      time: '09:00'
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: 'chore(deps)'
+      include: scope
+    reviewers:
+      - cliniqus

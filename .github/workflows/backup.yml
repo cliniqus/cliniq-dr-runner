@@ -1,0 +1,333 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Data Fortress — Scheduled Backup
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Runs the full `backup-fortress.js` operation daily at 02:00 UTC. Executes
+# directly on a GitHub-hosted Ubuntu runner (no dependency on Vercel function
+# timeouts), clones the private source repository at runtime using a
+# read-only fine-grained PAT, and writes backup artifacts to Cloudflare R2
+# (primary) and R2-Backup (off-site vault).
+#
+# Every Sunday additionally creates a timestamped snapshot (Phase-D1 Layer-3
+# enforcement), so the snapshot rotation policy in the BackupService always
+# has a fresh entry.
+#
+# SAFETY:
+#   - No `pull_request` trigger — forks cannot read secrets or run this.
+#   - `permissions: contents: read` at workflow level — GITHUB_TOKEN neutered.
+#   - Every action pinned to a 40-char SHA.
+#   - Secrets only reach the process via `env:` (never echoed / written to
+#     disk unmasked).
+#   - `--ignore-scripts` on npm ci blocks postinstall RCE vectors.
+#   - `concurrency:` prevents overlapping runs from corrupting snapshots.
+#   - Timeout hard-capped at 30 min (typical run is 12-18 min).
+#   - Always-on cleanup step wipes the cloned private repo before runner
+#     terminates (defence in depth — GitHub wipes the VM anyway).
+#
+# OBSERVABILITY:
+#   - Post-backup `dr:check-all` runs; workflow fails loudly if aggregate
+#     verdict is `fail`.
+#   - Optional Discord/Telegram alert on both success and failure.
+#   - Every run emits a one-line JSON audit record to the runner log.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: backup
+
+on:
+  schedule:
+    # 02:00 UTC daily. Chosen because:
+    #   - Outside peak traffic for most timezones.
+    #   - 4h before `dr-checks.yml` (which relies on the fresh
+    #     firebase/meta/last-backup.json written by this job).
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      snapshot:
+        description: 'Force snapshot creation (default: auto — snapshot on Sundays)'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - 'auto'
+          - 'yes'
+          - 'no'
+
+# Never allow more than one backup in flight — overlapping runs would
+# corrupt the snapshot rotation policy and double-bill R2 operations.
+concurrency:
+  group: backup-fortress
+  cancel-in-progress: false
+
+# Default workflow-level permissions. Individual steps cannot escalate.
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    name: Backup Firestore → R2 + R2-Backup
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # Route BackupService "local" layer writes to /tmp so the ephemeral
+      # runner has a valid writable path. The data is discarded when the
+      # VM terminates; this just keeps the backup code path happy without
+      # spamming meta.errors.
+      BACKUP_LOCAL_PATH_1: /tmp/fortress/local1
+      BACKUP_LOCAL_PATH_2: /tmp/fortress/local2
+
+    steps:
+      # ─────────────────────────────────────────────────────────────────
+      # 1. Checkout THIS (runner) repository. We only need it for the
+      # workflow file itself; all real code comes from the private clone.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Checkout runner repo
+        uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29  # v4.1.1
+        with:
+          persist-credentials: false
+
+      # ─────────────────────────────────────────────────────────────────
+      # 2. Clone the PRIVATE source repo using a read-only fine-grained
+      # PAT. `--depth=1 --no-tags` keeps the clone small and fast.
+      # The token is scoped to exactly this repo with read-only content
+      # permission; leaking it exposes source, nothing more.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Clone private source (read-only token)
+        env:
+          CLONE_TOKEN: ${{ secrets.CLONE_TOKEN }}
+          SRC_REPO: ${{ vars.SRC_REPO }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CLONE_TOKEN:-}" ]]; then
+            echo "::error::CLONE_TOKEN secret is not configured"; exit 1
+          fi
+          if [[ -z "${SRC_REPO:-}" ]]; then
+            echo "::error::SRC_REPO repository variable is not configured (expected e.g. cliniqus/cliniq-website)"; exit 1
+          fi
+          git clone --depth=1 --no-tags \
+            "https://x-access-token:${CLONE_TOKEN}@github.com/${SRC_REPO}.git" \
+            src
+          echo "Clone complete: $(git -C src rev-parse --short HEAD) on branch $(git -C src rev-parse --abbrev-ref HEAD)"
+
+      # ─────────────────────────────────────────────────────────────────
+      # 3. Node toolchain. Use the LTS major pinned here; bump via PR
+      # when the private repo's engines field changes.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Setup Node 20
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.1
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: src/package-lock.json
+
+      # ─────────────────────────────────────────────────────────────────
+      # 4. Install dependencies. `--ignore-scripts` blocks any malicious
+      # postinstall from a compromised dep. `npm ci` uses the lockfile
+      # — no version drift between runs.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Install dependencies (no scripts)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          echo "Installed $(ls node_modules | wc -l) top-level packages"
+
+      # ─────────────────────────────────────────────────────────────────
+      # 5. Decide whether to take a snapshot this run.
+      # Default heuristic: snapshot every Sunday (day-of-week = 0).
+      # Manual trigger can override via the workflow_dispatch input.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Decide snapshot mode
+        id: mode
+        run: |
+          set -euo pipefail
+          OVERRIDE="${{ github.event.inputs.snapshot }}"
+          DOW=$(date -u +%w)
+          if [[ "${OVERRIDE}" == "yes" ]]; then
+            echo "mode=snapshot" >> "$GITHUB_OUTPUT"
+            echo "Reason: manual override → snapshot"
+          elif [[ "${OVERRIDE}" == "no" ]]; then
+            echo "mode=backup" >> "$GITHUB_OUTPUT"
+            echo "Reason: manual override → plain backup"
+          elif [[ "${DOW}" == "0" ]]; then
+            echo "mode=snapshot" >> "$GITHUB_OUTPUT"
+            echo "Reason: Sunday → auto-snapshot"
+          else
+            echo "mode=backup" >> "$GITHUB_OUTPUT"
+            echo "Reason: weekday → plain backup"
+          fi
+
+      # ─────────────────────────────────────────────────────────────────
+      # 6. Run the backup. `dotenv` in backup-fortress.js does NOT
+      # override existing env vars, so the values below win over any
+      # (non-existent) .env.local on the runner.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Run backup
+        id: backup
+        working-directory: src
+        env:
+          # Firebase admin SDK
+          FIREBASE_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
+          FIREBASE_STORAGE_BUCKET: ${{ vars.FIREBASE_STORAGE_BUCKET }}
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+
+          # Primary R2 (writes firebase/live/* + firebase/meta/*)
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+
+          # Off-site R2-Backup vault
+          R2_BACKUP_ENDPOINT: ${{ secrets.R2_BACKUP_ENDPOINT }}
+          R2_BACKUP_ACCESS_KEY_ID: ${{ secrets.R2_BACKUP_ACCESS_KEY_ID }}
+          R2_BACKUP_SECRET_ACCESS_KEY: ${{ secrets.R2_BACKUP_SECRET_ACCESS_KEY }}
+          R2_BACKUP_BUCKET_NAME: ${{ vars.R2_BACKUP_BUCKET_NAME }}
+
+          # Optional mirror registry (if configured in the private repo)
+          FIREBASE_MIRROR_REGISTRY_JSON: ${{ secrets.FIREBASE_MIRROR_REGISTRY_JSON }}
+
+          # Optional alerting (used by Phase-D2 in the cron API; the
+          # local script also honours these envs)
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${BACKUP_LOCAL_PATH_1}" "${BACKUP_LOCAL_PATH_2}"
+
+          MODE="${{ steps.mode.outputs.mode }}"
+          echo "Starting backup-fortress in mode: ${MODE}"
+
+          START_TS=$(date -u +%s)
+          if [[ "${MODE}" == "snapshot" ]]; then
+            node scripts/backup-fortress.js snapshot
+          else
+            node scripts/backup-fortress.js backup
+          fi
+          END_TS=$(date -u +%s)
+          echo "duration_seconds=$((END_TS - START_TS))" >> "$GITHUB_OUTPUT"
+
+      # ─────────────────────────────────────────────────────────────────
+      # 7. Refresh the local cloud-backup-meta mirror file (used by
+      # dr:check-all) and run the full verification suite. If any
+      # check degrades to `fail`, this step errors and the workflow
+      # is marked failed — ensures silent regressions are impossible.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Verify integrity post-backup
+        id: verify
+        working-directory: src
+        env:
+          FIREBASE_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_BACKUP_ENDPOINT: ${{ secrets.R2_BACKUP_ENDPOINT }}
+          R2_BACKUP_ACCESS_KEY_ID: ${{ secrets.R2_BACKUP_ACCESS_KEY_ID }}
+          R2_BACKUP_SECRET_ACCESS_KEY: ${{ secrets.R2_BACKUP_SECRET_ACCESS_KEY }}
+          R2_BACKUP_BUCKET_NAME: ${{ vars.R2_BACKUP_BUCKET_NAME }}
+          # Home-vault root so audit scripts write where check-* reads
+          # from (the fix landed in commit 38cf985).
+          CLINIQ_BACKUP_VAULT_ROOT: ${{ runner.temp }}/dr-vault
+        run: |
+          set -euo pipefail
+          mkdir -p "${CLINIQ_BACKUP_VAULT_ROOT}"
+          # Audits write fresh evidence into the home-vault location.
+          npm run dr:audit-firebase || echo "::warning::audit-firebase exited non-zero; continuing"
+          npm run dr:audit-cloudflare
+          # check-all reads from the same vault and prints the aggregate.
+          npm run dr:check-all
+          AGG=$(jq -r '.aggregate' "${CLINIQ_BACKUP_VAULT_ROOT}/verification/check-all.json")
+          echo "aggregate=${AGG}" >> "$GITHUB_OUTPUT"
+          echo "Post-backup aggregate: ${AGG}"
+          if [[ "${AGG}" == "fail" ]]; then
+            echo "::error::DR aggregate is FAIL after backup — investigate immediately"
+            jq -r '.results[] | select(.status=="fail") | "  - \(.id): \(.status)"' \
+              "${CLINIQ_BACKUP_VAULT_ROOT}/verification/check-all.json"
+            exit 1
+          fi
+
+      # ─────────────────────────────────────────────────────────────────
+      # 8. Sync the freshly-generated verification artifacts to R2 so
+      # the admin dashboard can read them on next refresh.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Sync DR vault to R2
+        working-directory: src
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          CLINIQ_BACKUP_VAULT_ROOT: ${{ runner.temp }}/dr-vault
+        run: |
+          set -euo pipefail
+          npx tsx scripts/dr/sync-dr-vault-to-r2.ts --apply
+
+      # ─────────────────────────────────────────────────────────────────
+      # 9. Emit a one-line audit record to the runner log. These are
+      # cross-referenceable against the GitHub Actions run history and
+      # would reveal any unexpected runs (e.g. after credential compromise).
+      # ─────────────────────────────────────────────────────────────────
+      - name: Emit audit record
+        if: always()
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+          DURATION: ${{ steps.backup.outputs.duration_seconds }}
+          AGG: ${{ steps.verify.outputs.aggregate }}
+          RESULT: ${{ job.status }}
+        run: |
+          printf 'DR_AUDIT %s\n' "$(jq -nc \
+            --arg runId   "${{ github.run_id }}" \
+            --arg runNum  "${{ github.run_number }}" \
+            --arg actor   "${{ github.actor }}" \
+            --arg event   "${{ github.event_name }}" \
+            --arg sha     "${{ github.sha }}" \
+            --arg ts      "$(date -u -Iseconds)" \
+            --arg mode    "${MODE:-unknown}" \
+            --arg dur     "${DURATION:-0}" \
+            --arg agg     "${AGG:-unknown}" \
+            --arg result  "${RESULT}" \
+            '{runId:$runId, runNumber:$runNum, actor:$actor, event:$event, sha:$sha, ts:$ts, mode:$mode, durationSeconds:($dur|tonumber), aggregate:$agg, result:$result}')"
+
+      # ─────────────────────────────────────────────────────────────────
+      # 10. Defence-in-depth cleanup. Even though GitHub wipes the
+      # runner VM, explicit `rm -rf` ensures no partial artifact
+      # survives into any shared storage that a future runner might
+      # inherit (unlikely but cheap).
+      # ─────────────────────────────────────────────────────────────────
+      - name: Scrub workspace
+        if: always()
+        run: |
+          set -u
+          rm -rf src /tmp/fortress "${RUNNER_TEMP}/dr-vault" || true
+
+      # ─────────────────────────────────────────────────────────────────
+      # 11. Final notification — optional Discord post. Only fires if
+      # the webhook is configured; otherwise skipped silently.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Notify Discord
+        if: always() && env.DISCORD_WEBHOOK_URL != ''
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          STATUS: ${{ job.status }}
+          MODE: ${{ steps.mode.outputs.mode }}
+          DURATION: ${{ steps.backup.outputs.duration_seconds }}
+          AGG: ${{ steps.verify.outputs.aggregate }}
+        run: |
+          set +e
+          if [[ "${STATUS}" == "success" ]]; then
+            EMOJI="✅"; COLOR=3066993
+          else
+            EMOJI="🚨"; COLOR=15158332
+          fi
+          PAYLOAD=$(jq -nc \
+            --arg title "${EMOJI} Daily backup — ${STATUS}" \
+            --arg desc  "mode: ${MODE:-n/a} • duration: ${DURATION:-?}s • aggregate: ${AGG:-n/a}" \
+            --arg url   "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson color "${COLOR}" \
+            '{embeds:[{title:$title, description:$desc, url:$url, color:$color}]}')
+          curl -sS -H 'Content-Type: application/json' \
+            -d "${PAYLOAD}" \
+            "${DISCORD_WEBHOOK_URL}" >/dev/null || true
