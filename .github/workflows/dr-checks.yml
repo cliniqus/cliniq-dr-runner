@@ -6,7 +6,7 @@
 # Runs the full read-only verification pipeline daily at 06:00 UTC:
 #   1. audit-live-firebase        — inventory Firestore collections
 #   2. audit-live-cloudflare      — mirror R2 backup meta to docs/dr/
-#   3. check-all                  — 6 independent integrity checks
+#   3. check-all                  — full DR integrity + retention checks
 #   4. sync-dr-vault-to-r2        — ship fresh evidence to R2
 #
 # This refreshes the admin dashboard's evidence so indicators like
@@ -132,7 +132,8 @@ jobs:
           # Non-fatal: token may lack Zone:Read.
           npm run dr:audit-cloudflare || echo "::warning::audit-cloudflare failed (token may lack Zone:Read); continuing"
 
-          # Run the 6 independent checks. Records per-check verdict.
+          # Run every independent DR check, including retention and legacy-name
+          # guardrails. Records per-check verdict.
           npm run dr:check-all
           CHECK_CODE=$?
 
@@ -152,7 +153,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
           echo "Aggregate: ${AGG}"
-          if [[ "${CHECK_CODE}" != "0" || "${AGG}" == "fail" ]]; then
+          if [[ "${AGG}" == "fail" || "${AGG}" == "unknown" || ( "${CHECK_CODE}" != "0" && "${AGG}" != "warn" ) ]]; then
             echo "::error::DR aggregate is FAIL — immediate attention required"
           fi
           if [[ "${AGG}" == "warn" ]]; then
@@ -176,7 +177,7 @@ jobs:
         run: npx tsx scripts/dr/sync-dr-vault-to-r2.ts --apply
 
       - name: Fail job on hard DR failure
-        if: always() && (steps.verify.outputs.check_code != '0' || steps.verify.outputs.aggregate == 'fail')
+        if: always() && (steps.verify.outputs.aggregate == 'fail' || steps.verify.outputs.aggregate == 'unknown' || (steps.verify.outputs.check_code != '0' && steps.verify.outputs.aggregate != 'warn'))
         run: exit 1
 
       - name: Emit audit record
