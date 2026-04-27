@@ -1,0 +1,89 @@
+---
+name: mirror-auth-sync
+
+on:
+  schedule:
+    # Runs after the daily backup has had time to publish _firebase_auth.json.
+    # This is not real-time password mirroring; it is a scheduled recoverable
+    # Auth-state sync using the latest exported hash data.
+    - cron: '15 3 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: mirror-auth-sync
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sync-auth:
+    name: Sync Firebase Auth export into mirrors
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Call mirror Firebase Auth endpoint
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          PRODUCTION_BASE_URL: ${{ vars.PRODUCTION_BASE_URL }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CRON_SECRET:-}" ]]; then
+            echo "::error::CRON_SECRET secret is not configured"; exit 1
+          fi
+          BASE_URL="${PRODUCTION_BASE_URL:-https://www.cliniqus.com}"
+          URL="${BASE_URL%/}/api/cron/mirror-firebase"
+          HTTP_CODE=$(curl -sS --max-time 360 \
+            -w "%{http_code}" \
+            -o mirror-auth-response.json \
+            -H "Authorization: Bearer ${CRON_SECRET}" \
+            "${URL}")
+
+          jq '{success, authUsersImported, durationMs, errors}' mirror-auth-response.json 2>/dev/null || true
+
+          if [[ "${HTTP_CODE}" -lt 200 || "${HTTP_CODE}" -ge 300 ]]; then
+            echo "::error::Mirror Auth sync failed with HTTP ${HTTP_CODE}"
+            exit 1
+          fi
+
+      - name: Emit audit record
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+        run: |
+          printf 'DR_AUDIT %s\n' "$(jq -nc \
+            --arg workflow "mirror-auth-sync" \
+            --arg runId   "${{ github.run_id }}" \
+            --arg actor   "${{ github.actor }}" \
+            --arg event   "${{ github.event_name }}" \
+            --arg ts      "$(date -u -Iseconds)" \
+            --arg result  "${RESULT}" \
+            '{workflow:$workflow, runId:$runId, actor:$actor, event:$event, ts:$ts, result:$result}')"
+
+      - name: Notify Discord on failure
+        if: always() && job.status != 'success'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          set +e
+          if [[ -z "${DISCORD_WEBHOOK_URL:-}" ]]; then exit 0; fi
+          PAYLOAD=$(jq -nc \
+            --arg title "Mirror Auth sync failed" \
+            --arg url   "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{embeds:[{title:$title, url:$url, color:15158332}]}')
+          curl -sS -H 'Content-Type: application/json' -d "${PAYLOAD}" "${DISCORD_WEBHOOK_URL}" >/dev/null || true
+
+      - name: Notify Telegram on failure
+        if: always() && job.status != 'success'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set +e
+          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then exit 0; fi
+          MSG="Mirror Auth sync failed%0A%0AURL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "text=${MSG}" \
+            -d "parse_mode=HTML" >/dev/null || true

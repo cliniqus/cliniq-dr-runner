@@ -70,6 +70,7 @@ jobs:
     timeout-minutes: 30
 
     env:
+      CLINIQ_SOURCE_ROOT: ${{ github.workspace }}/source-workspace
       # Route BackupService "local" layer writes to /tmp so the ephemeral
       # runner has a valid writable path. The data is discarded when the
       # VM terminates; this just keeps the backup code path happy without
@@ -88,7 +89,7 @@ jobs:
           persist-credentials: false
 
       # ─────────────────────────────────────────────────────────────────
-      # 2. Clone the PRIVATE source repo using a read-only fine-grained
+      # 2. Clone the PRIVATE source repos using a read-only fine-grained
       # PAT. `--depth=1 --no-tags` keeps the clone small and fast.
       # The token is scoped to exactly this repo with read-only content
       # permission; leaking it exposes source, nothing more.
@@ -97,6 +98,7 @@ jobs:
         env:
           CLONE_TOKEN: ${{ secrets.CLONE_TOKEN }}
           SRC_REPO: ${{ vars.SRC_REPO }}
+          FIREBASE_APP_REPO: ${{ vars.FIREBASE_APP_REPO }}
         run: |
           set -euo pipefail
           if [[ -z "${CLONE_TOKEN:-}" ]]; then
@@ -105,10 +107,22 @@ jobs:
           if [[ -z "${SRC_REPO:-}" ]]; then
             echo "::error::SRC_REPO repository variable is not configured (expected e.g. cliniqus/cliniq-website)"; exit 1
           fi
+          FIREBASE_REPO="${FIREBASE_APP_REPO:-cliniqus/cliniq-app}"
+          rm -rf "${CLINIQ_SOURCE_ROOT}"
+          mkdir -p "${CLINIQ_SOURCE_ROOT}"
           git clone --depth=1 --no-tags \
             "https://x-access-token:${CLONE_TOKEN}@github.com/${SRC_REPO}.git" \
-            src
-          echo "Clone complete: $(git -C src rev-parse --short HEAD) on branch $(git -C src rev-parse --abbrev-ref HEAD)"
+            "${CLINIQ_SOURCE_ROOT}/cliniq-website"
+          git clone --depth=1 --no-tags \
+            "https://x-access-token:${CLONE_TOKEN}@github.com/${FIREBASE_REPO}.git" \
+            "${CLINIQ_SOURCE_ROOT}/cliniq"
+          test -f "${CLINIQ_SOURCE_ROOT}/cliniq-website/package-lock.json"
+          test -f "${CLINIQ_SOURCE_ROOT}/cliniq/firebase.json"
+          test -f "${CLINIQ_SOURCE_ROOT}/cliniq/firestore.rules"
+          test -f "${CLINIQ_SOURCE_ROOT}/cliniq/firestore.indexes.json"
+          test -f "${CLINIQ_SOURCE_ROOT}/cliniq/storage.rules"
+          echo "Website clone: $(git -C "${CLINIQ_SOURCE_ROOT}/cliniq-website" rev-parse --short HEAD)"
+          echo "Firebase app clone: $(git -C "${CLINIQ_SOURCE_ROOT}/cliniq" rev-parse --short HEAD)"
 
       # ─────────────────────────────────────────────────────────────────
       # 3. Node toolchain. Use the LTS major pinned here; bump via PR
@@ -119,7 +133,7 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: src/package-lock.json
+          cache-dependency-path: source-workspace/cliniq-website/package-lock.json
 
       # ─────────────────────────────────────────────────────────────────
       # 4. Install dependencies. `--ignore-scripts` blocks any malicious
@@ -127,7 +141,7 @@ jobs:
       # — no version drift between runs.
       # ─────────────────────────────────────────────────────────────────
       - name: Install dependencies (no scripts)
-        working-directory: src
+        working-directory: source-workspace/cliniq-website
         run: |
           set -euo pipefail
           npm ci --ignore-scripts --no-audit --no-fund
@@ -165,8 +179,9 @@ jobs:
       # ─────────────────────────────────────────────────────────────────
       - name: Run backup
         id: backup
-        working-directory: src
+        working-directory: source-workspace/cliniq-website
         env:
+          CLINIQ_WORKSPACE_ROOT: ${{ github.workspace }}/source-workspace
           # Firebase admin SDK
           FIREBASE_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
           FIREBASE_STORAGE_BUCKET: ${{ vars.FIREBASE_STORAGE_BUCKET }}
@@ -216,7 +231,8 @@ jobs:
       # ─────────────────────────────────────────────────────────────────
       - name: Run post-backup verification
         id: verify
-        working-directory: src
+        if: always()
+        working-directory: source-workspace/cliniq-website
         env:
           FIREBASE_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
           NEXT_PUBLIC_FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
@@ -233,39 +249,54 @@ jobs:
           # Home-vault root so audit scripts write where check-* reads
           # from (the fix landed in commit 38cf985).
           CLINIQ_BACKUP_VAULT_ROOT: ${{ runner.temp }}/dr-vault
+          CLINIQ_WORKSPACE_ROOT: ${{ github.workspace }}/source-workspace
         run: |
-          set -euo pipefail
+          set +e
           mkdir -p "${CLINIQ_BACKUP_VAULT_ROOT}"
           # Audits write fresh evidence into the home-vault location.
           npm run dr:audit-firebase || echo "::warning::audit-firebase exited non-zero; continuing"
           npm run dr:audit-cloudflare || echo "::warning::audit-cloudflare failed (token may lack Zone:Read); continuing"
           # check-all reads from the same vault and prints the aggregate.
           npm run dr:check-all
-          AGG=$(jq -r '.aggregate' "${CLINIQ_BACKUP_VAULT_ROOT}/verification/check-all.json")
+          CHECK_CODE=$?
+          AGG="unknown"
+          if [[ -f "${CLINIQ_BACKUP_VAULT_ROOT}/verification/check-all.json" ]]; then
+            AGG=$(jq -r '.aggregate // "unknown"' "${CLINIQ_BACKUP_VAULT_ROOT}/verification/check-all.json")
+          fi
           echo "aggregate=${AGG}" >> "$GITHUB_OUTPUT"
+          echo "check_code=${CHECK_CODE}" >> "$GITHUB_OUTPUT"
           echo "Post-backup aggregate: ${AGG}"
-          if [[ "${AGG}" == "fail" ]]; then
+          if [[ "${CHECK_CODE}" != "0" || "${AGG}" == "fail" ]]; then
             echo "::error::DR aggregate is FAIL after backup — investigate immediately"
             jq -r '.results[] | select(.status=="fail") | "  - \(.id): \(.status)"' \
-              "${CLINIQ_BACKUP_VAULT_ROOT}/verification/check-all.json"
-            exit 1
+              "${CLINIQ_BACKUP_VAULT_ROOT}/verification/check-all.json" 2>/dev/null || true
           fi
+          exit 0
 
       # ─────────────────────────────────────────────────────────────────
       # 8. Sync the freshly-generated verification artifacts to R2 so
       # the admin dashboard can read them on next refresh.
       # ─────────────────────────────────────────────────────────────────
       - name: Sync DR vault to R2
-        working-directory: src
+        if: always()
+        working-directory: source-workspace/cliniq-website
         env:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_BACKUP_ENDPOINT: ${{ secrets.R2_BACKUP_ENDPOINT }}
+          R2_BACKUP_ACCESS_KEY_ID: ${{ secrets.R2_BACKUP_ACCESS_KEY_ID }}
+          R2_BACKUP_SECRET_ACCESS_KEY: ${{ secrets.R2_BACKUP_SECRET_ACCESS_KEY }}
+          R2_BACKUP_BUCKET_NAME: ${{ vars.R2_BACKUP_BUCKET_NAME }}
           CLINIQ_BACKUP_VAULT_ROOT: ${{ runner.temp }}/dr-vault
         run: |
           set -euo pipefail
           npx tsx scripts/dr/sync-dr-vault-to-r2.ts --apply
+
+      - name: Fail job on hard DR failure
+        if: always() && (steps.verify.outputs.check_code != '0' || steps.verify.outputs.aggregate == 'fail')
+        run: exit 1
 
       # ─────────────────────────────────────────────────────────────────
       # 9. Emit a one-line audit record to the runner log. These are
@@ -303,7 +334,7 @@ jobs:
         if: always()
         run: |
           set -u
-          rm -rf src /tmp/fortress "${RUNNER_TEMP}/dr-vault" || true
+          rm -rf "${CLINIQ_SOURCE_ROOT}" /tmp/fortress "${RUNNER_TEMP}/dr-vault" || true
 
       # ─────────────────────────────────────────────────────────────────
       # 11. Final notification — optional Discord post. Only fires if
