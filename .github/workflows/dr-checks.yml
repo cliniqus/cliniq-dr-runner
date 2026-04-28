@@ -50,6 +50,7 @@ jobs:
 
     env:
       CLINIQ_SOURCE_ROOT: ${{ github.workspace }}/source-workspace
+      CLINIQ_WORKSPACE_ROOT: ${{ github.workspace }}/source-workspace
 
     steps:
       - name: Checkout runner repo
@@ -71,14 +72,23 @@ jobs:
             echo "::error::SRC_REPO repository variable is not configured (expected e.g. cliniqus/cliniq-website)"; exit 1
           fi
           FIREBASE_REPO="${FIREBASE_APP_REPO:-cliniqus/cliniq-app}"
+          SOURCE_REF="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-main}}"
           rm -rf "${CLINIQ_SOURCE_ROOT}"
           mkdir -p "${CLINIQ_SOURCE_ROOT}"
-          git clone --depth=1 --no-tags \
-            "https://x-access-token:${CLONE_TOKEN}@github.com/${SRC_REPO}.git" \
-            "${CLINIQ_SOURCE_ROOT}/cliniq-website"
-          git clone --depth=1 --no-tags \
-            "https://x-access-token:${CLONE_TOKEN}@github.com/${FIREBASE_REPO}.git" \
-            "${CLINIQ_SOURCE_ROOT}/cliniq"
+          clone_repo() {
+            local repo="$1"
+            local dest="$2"
+            local url="https://x-access-token:${CLONE_TOKEN}@github.com/${repo}.git"
+            if git ls-remote --exit-code --heads "${url}" "${SOURCE_REF}" >/dev/null 2>&1; then
+              echo "Cloning ${repo}@${SOURCE_REF}"
+              git clone --depth=1 --no-tags --branch "${SOURCE_REF}" "${url}" "${dest}"
+            else
+              echo "::warning::${repo} has no branch ${SOURCE_REF}; cloning default branch"
+              git clone --depth=1 --no-tags "${url}" "${dest}"
+            fi
+          }
+          clone_repo "${SRC_REPO}" "${CLINIQ_SOURCE_ROOT}/cliniq-website"
+          clone_repo "${FIREBASE_REPO}" "${CLINIQ_SOURCE_ROOT}/cliniq"
           test -f "${CLINIQ_SOURCE_ROOT}/cliniq-website/package-lock.json"
           test -f "${CLINIQ_SOURCE_ROOT}/cliniq/firebase.json"
           test -f "${CLINIQ_SOURCE_ROOT}/cliniq/firestore.rules"
