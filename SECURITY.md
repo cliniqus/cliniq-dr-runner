@@ -2,10 +2,11 @@
 
 ## Threat model
 
-This repository is a **public scheduler** for scripts that live in a
-separate private repository. Its public surface consists of:
+This repository is a **public scheduler** for scripts and Firebase
+configuration that live in separate private repositories. Its public
+surface consists of:
 
-- Three GitHub Actions workflow YAML files.
+- GitHub Actions workflow YAML files.
 - A README, LICENSE, and this SECURITY.md.
 
 **It contains no secrets, no source code, no data, no credentials.**
@@ -15,7 +16,7 @@ keys, authentication tokens) lives exclusively in two places:
 
 1. **GitHub Secrets** on this repository (encrypted at rest with AES-256-GCM,
    decrypted only inside ephemeral runner VMs, never printed to logs).
-2. **The private source repository**, which is never exposed.
+2. **The private source repositories**, which are never exposed.
 
 ## Defence layers
 
@@ -23,10 +24,11 @@ keys, authentication tokens) lives exclusively in two places:
 
 | Credential | Scope | Worst-case impact if leaked |
 | --- | --- | --- |
-| `CLONE_TOKEN` (fine-grained PAT) | Read-only, single repository, 90-day TTL | Attacker can read source code until rotation |
+| `CLONE_TOKEN` (fine-grained PAT) | Read-only Contents access to `SRC_REPO` and `FIREBASE_APP_REPO`, 90-day TTL | Attacker can read source and Firebase config until rotation |
 | `FIREBASE_SERVICE_ACCOUNT_KEY` | `roles/datastore.viewer` + `firebaseauth.viewer` only | Attacker can read Firestore; cannot write, delete, or modify IAM |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | Write-scoped to specific bucket + prefix | Attacker can upload objects; versioning prevents permanent deletion |
 | `R2_BACKUP_*` | Same pattern on backup bucket | Same as above |
+| `CRON_SECRET` | Bearer token for production cron endpoints | Attacker can trigger backup/mirror maintenance endpoints until rotation |
 | `DISCORD_WEBHOOK_URL` (optional) | Post-only to one channel | Attacker can spam one channel |
 
 ### 2. Workflow safety
@@ -89,13 +91,14 @@ The following are **not** considered vulnerabilities:
 - The cron schedule being visible. Timing information does not provide
   an attacker with any capability; the authentication surface does not
   depend on secrecy of schedules.
-- The public runner running on a public schedule against a private
-  source repository. This is the documented design pattern.
+- The public runner running on a public schedule against private
+  source repositories. This is the documented design pattern.
 
 ## Maintenance commitments
 
 - `CLONE_TOKEN` is rotated every 90 days or immediately upon any
-  suspected compromise.
+  suspected compromise, and its repository allow-list is kept to only
+  `SRC_REPO` and `FIREBASE_APP_REPO`.
 - `actions/*` SHA pins are reviewed quarterly via Dependabot PRs.
 - Every secret is rotated at least annually.
 - Any change to workflow YAML requires a pull request; the sole

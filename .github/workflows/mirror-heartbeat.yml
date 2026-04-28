@@ -1,0 +1,89 @@
+---
+name: mirror-heartbeat
+
+on:
+  schedule:
+    # Every 10 minutes, offset from the top of the hour to reduce GitHub
+    # scheduler crowding. This keeps the 15-minute mirror lag gate meaningful
+    # without depending on Vercel Cron.
+    - cron: '3,13,23,33,43,53 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: mirror-heartbeat
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  heartbeat:
+    name: Probe Firebase mirror heartbeat
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Call mirror heartbeat endpoint
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          PRODUCTION_BASE_URL: ${{ vars.PRODUCTION_BASE_URL }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CRON_SECRET:-}" ]]; then
+            echo "::error::CRON_SECRET secret is not configured"; exit 1
+          fi
+          BASE_URL="${PRODUCTION_BASE_URL:-https://www.cliniqus.com}"
+          URL="${BASE_URL%/}/api/cron/mirror-heartbeat"
+          HTTP_CODE=$(curl -sS --max-time 180 \
+            -w "%{http_code}" \
+            -o heartbeat-response.json \
+            -H "Authorization: Bearer ${CRON_SECRET}" \
+            "${URL}")
+
+          jq '{ok, mirrorCount, unhealthyCount, probes}' heartbeat-response.json 2>/dev/null || true
+
+          if [[ "${HTTP_CODE}" -lt 200 || "${HTTP_CODE}" -ge 300 ]]; then
+            echo "::error::Mirror heartbeat failed with HTTP ${HTTP_CODE}"
+            exit 1
+          fi
+
+      - name: Emit audit record
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+        run: |
+          printf 'DR_AUDIT %s\n' "$(jq -nc \
+            --arg workflow "mirror-heartbeat" \
+            --arg runId   "${{ github.run_id }}" \
+            --arg actor   "${{ github.actor }}" \
+            --arg event   "${{ github.event_name }}" \
+            --arg ts      "$(date -u -Iseconds)" \
+            --arg result  "${RESULT}" \
+            '{workflow:$workflow, runId:$runId, actor:$actor, event:$event, ts:$ts, result:$result}')"
+
+      - name: Notify Discord on failure
+        if: always() && job.status != 'success'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          set +e
+          if [[ -z "${DISCORD_WEBHOOK_URL:-}" ]]; then exit 0; fi
+          PAYLOAD=$(jq -nc \
+            --arg title "Mirror heartbeat failed" \
+            --arg url   "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{embeds:[{title:$title, url:$url, color:15158332}]}')
+          curl -sS -H 'Content-Type: application/json' -d "${PAYLOAD}" "${DISCORD_WEBHOOK_URL}" >/dev/null || true
+
+      - name: Notify Telegram on failure
+        if: always() && job.status != 'success'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set +e
+          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then exit 0; fi
+          MSG="Mirror heartbeat failed%0A%0AURL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "text=${MSG}" \
+            -d "parse_mode=HTML" >/dev/null || true
