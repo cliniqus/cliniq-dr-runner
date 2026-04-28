@@ -61,6 +61,8 @@ jobs:
       - name: Clone private source
         env:
           CLONE_TOKEN: ${{ secrets.CLONE_TOKEN }}
+          FIREBASE_APP_CLONE_TOKEN: ${{ secrets.FIREBASE_APP_CLONE_TOKEN }}
+          FIREBASE_APP_DEPLOY_KEY: ${{ secrets.FIREBASE_APP_DEPLOY_KEY }}
           SRC_REPO: ${{ vars.SRC_REPO }}
           FIREBASE_APP_REPO: ${{ vars.FIREBASE_APP_REPO }}
         run: |
@@ -75,10 +77,26 @@ jobs:
           SOURCE_REF="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-main}}"
           rm -rf "${CLINIQ_SOURCE_ROOT}"
           mkdir -p "${CLINIQ_SOURCE_ROOT}"
-          clone_repo() {
+
+          setup_app_ssh() {
+            if [[ -z "${FIREBASE_APP_DEPLOY_KEY:-}" ]]; then
+              return 1
+            fi
+
+            mkdir -p "${HOME}/.ssh"
+            chmod 700 "${HOME}/.ssh"
+            printf '%s\n' "${FIREBASE_APP_DEPLOY_KEY}" > "${HOME}/.ssh/cliniq_app_deploy_key"
+            chmod 600 "${HOME}/.ssh/cliniq_app_deploy_key"
+            ssh-keyscan -H github.com >> "${HOME}/.ssh/known_hosts"
+            eval "$(ssh-agent -s)" >/dev/null
+            ssh-add "${HOME}/.ssh/cliniq_app_deploy_key" >/dev/null
+            return 0
+          }
+
+          clone_repo_from_url() {
             local repo="$1"
             local dest="$2"
-            local url="https://x-access-token:${CLONE_TOKEN}@github.com/${repo}.git"
+            local url="$3"
             if git ls-remote --exit-code --heads "${url}" "${SOURCE_REF}" >/dev/null 2>&1; then
               echo "Cloning ${repo}@${SOURCE_REF}"
               git clone --depth=1 --no-tags --branch "${SOURCE_REF}" "${url}" "${dest}"
@@ -87,8 +105,18 @@ jobs:
               git clone --depth=1 --no-tags "${url}" "${dest}"
             fi
           }
-          clone_repo "${SRC_REPO}" "${CLINIQ_SOURCE_ROOT}/cliniq-website"
-          clone_repo "${FIREBASE_REPO}" "${CLINIQ_SOURCE_ROOT}/cliniq"
+
+          WEBSITE_URL="https://x-access-token:${CLONE_TOKEN}@github.com/${SRC_REPO}.git"
+          if setup_app_ssh; then
+            FIREBASE_URL="git@github.com:${FIREBASE_REPO}.git"
+          elif [[ -n "${FIREBASE_APP_CLONE_TOKEN:-}" ]]; then
+            FIREBASE_URL="https://x-access-token:${FIREBASE_APP_CLONE_TOKEN}@github.com/${FIREBASE_REPO}.git"
+          else
+            FIREBASE_URL="https://x-access-token:${CLONE_TOKEN}@github.com/${FIREBASE_REPO}.git"
+          fi
+
+          clone_repo_from_url "${SRC_REPO}" "${CLINIQ_SOURCE_ROOT}/cliniq-website" "${WEBSITE_URL}"
+          clone_repo_from_url "${FIREBASE_REPO}" "${CLINIQ_SOURCE_ROOT}/cliniq" "${FIREBASE_URL}"
           test -f "${CLINIQ_SOURCE_ROOT}/cliniq-website/package-lock.json"
           test -f "${CLINIQ_SOURCE_ROOT}/cliniq/firebase.json"
           test -f "${CLINIQ_SOURCE_ROOT}/cliniq/firestore.rules"
@@ -172,7 +200,7 @@ jobs:
           exit 0
 
       - name: Sync DR vault to R2
-        if: always()
+        if: always() && steps.verify.outcome != 'skipped'
         working-directory: source-workspace/cliniq-website
         env:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
