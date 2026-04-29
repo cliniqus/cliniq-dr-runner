@@ -1,0 +1,208 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Data Fortress — Quarterly Restore Drill (Phase 3.3)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Runs the full restore drill against the isolated DR Firebase project
+# (`cliniq-dr-isolated-20260417` / `crypto-volt-380315`) once per quarter on
+# the first Sunday at 05:00 UTC. The drill is documented in
+# `cliniq-website/scripts/dr/run-restore-drill.ts` and proves end-to-end
+# that the backup pipeline can actually be restored from — backups that
+# nobody ever restored have a habit of being unrestorable when needed.
+#
+# The schedule is intentionally rare because:
+#   1. The drill consumes ~3-4 GitHub Actions minutes (well within free
+#      tier quotas, but worth being deliberate about).
+#   2. It exercises real R2 reads and Firestore writes against the
+#      isolated DR project, which is a non-trivial side-effect to audit.
+#
+# Re-runnable on demand via `gh workflow run restore-drill-quarterly.yml`
+# whenever you want fresh evidence (e.g. after a major schema change or
+# before a planned migration).
+#
+# SAFETY profile identical to backup.yml + dr-checks.yml:
+#   - schedule + workflow_dispatch only
+#   - contents:read permissions
+#   - SHA-pinned actions
+#   - secrets via env only
+#   - --ignore-scripts on npm ci
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: restore-drill-quarterly
+
+on:
+  schedule:
+    # First Sunday of every quarter (Jan, Apr, Jul, Oct) at 05:00 UTC.
+    # Cron expressions can't directly say "first of the quarter, Sunday only",
+    # so we trigger every Sunday in the relevant months and gate inside the
+    # job on the day-of-month being <= 7.
+    - cron: '0 5 * * 0'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Run even if not in the first week of a quarter month'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+concurrency:
+  group: restore-drill-quarterly
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  drill:
+    name: Run quarterly restore drill
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      CLINIQ_SOURCE_ROOT: ${{ github.workspace }}/source-workspace
+      CLINIQ_WORKSPACE_ROOT: ${{ github.workspace }}/source-workspace
+
+    steps:
+      - name: Decide whether to run on schedule
+        id: gate
+        run: |
+          set -euo pipefail
+          DAY_OF_MONTH=$(date -u +%d)
+          MONTH=$(date -u +%m)
+          FORCE="${{ github.event.inputs.force }}"
+          # Only run on the first Sunday of Jan/Apr/Jul/Oct unless forced.
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            if [[ "${MONTH}" != "01" && "${MONTH}" != "04" && "${MONTH}" != "07" && "${MONTH}" != "10" ]]; then
+              echo "skipping: month ${MONTH} is not a quarter-start month"
+              echo "should_run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if (( 10#${DAY_OF_MONTH} > 7 )); then
+              echo "skipping: today is the second Sunday of ${MONTH}, not the first"
+              echo "should_run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          elif [[ "${FORCE}" != "true" ]]; then
+            echo "manual run without --force — running anyway"
+          fi
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout runner repo
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29  # v4.1.1
+        with:
+          persist-credentials: false
+
+      - name: Clone private source
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          CLONE_TOKEN: ${{ secrets.CLONE_TOKEN }}
+          SRC_REPO: ${{ vars.SRC_REPO }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CLONE_TOKEN:-}" ]]; then
+            echo "::error::CLONE_TOKEN secret is not configured"; exit 1
+          fi
+          if [[ -z "${SRC_REPO:-}" ]]; then
+            echo "::error::SRC_REPO repository variable is not configured"; exit 1
+          fi
+          rm -rf "${CLINIQ_SOURCE_ROOT}"
+          mkdir -p "${CLINIQ_SOURCE_ROOT}"
+          git clone --depth=1 --no-tags \
+            "https://x-access-token:${CLONE_TOKEN}@github.com/${SRC_REPO}.git" \
+            "${CLINIQ_SOURCE_ROOT}/cliniq-website"
+
+      - name: Setup Node 20
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.1
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: source-workspace/cliniq-website/package-lock.json
+
+      - name: Install dependencies (no scripts)
+        if: steps.gate.outputs.should_run == 'true'
+        working-directory: source-workspace/cliniq-website
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run restore drill
+        if: steps.gate.outputs.should_run == 'true'
+        id: drill
+        working-directory: source-workspace/cliniq-website
+        env:
+          # Restore drill targets the isolated DR project — NEVER primary.
+          FIREBASE_ISOLATED_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_ISOLATED_SERVICE_ACCOUNT_KEY }}
+          FIREBASE_ISOLATED_PROJECT_ID: ${{ vars.FIREBASE_ISOLATED_PROJECT_ID }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_BACKUP_ENDPOINT: ${{ secrets.R2_BACKUP_ENDPOINT }}
+          R2_BACKUP_ACCESS_KEY_ID: ${{ secrets.R2_BACKUP_ACCESS_KEY_ID }}
+          R2_BACKUP_SECRET_ACCESS_KEY: ${{ secrets.R2_BACKUP_SECRET_ACCESS_KEY }}
+          R2_BACKUP_BUCKET_NAME: ${{ vars.R2_BACKUP_BUCKET_NAME }}
+          R2_ISOLATED_BUCKET_NAME: ${{ vars.R2_ISOLATED_BUCKET_NAME }}
+          CLINIQ_BACKUP_VAULT_ROOT: ${{ runner.temp }}/dr-vault
+          CLINIQ_WORKSPACE_ROOT: ${{ github.workspace }}/source-workspace
+        run: |
+          set +e
+          mkdir -p "${CLINIQ_BACKUP_VAULT_ROOT}"
+          npx tsx scripts/dr/run-restore-drill.ts > drill.stdout.log 2>&1
+          code=$?
+          tail -n 200 drill.stdout.log
+          echo "drill_code=${code}" >> "$GITHUB_OUTPUT"
+          STATUS="unknown"
+          if [[ -f "${CLINIQ_BACKUP_VAULT_ROOT}/restore/run-restore-drill.json" ]]; then
+            STATUS=$(jq -r '.status // "unknown"' "${CLINIQ_BACKUP_VAULT_ROOT}/restore/run-restore-drill.json")
+          fi
+          echo "drill_status=${STATUS}" >> "$GITHUB_OUTPUT"
+          # Don't fail the step here — let the explicit gate below decide so
+          # the audit/notification steps always have access to the artifacts.
+          exit 0
+
+      - name: Upload drill artifact
+        if: steps.gate.outputs.should_run == 'true' && always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        with:
+          name: restore-drill-${{ github.run_id }}
+          path: ${{ runner.temp }}/dr-vault/restore/
+          retention-days: 90
+
+      - name: Emit audit record
+        if: steps.gate.outputs.should_run == 'true' && always()
+        env:
+          STATUS: ${{ steps.drill.outputs.drill_status }}
+          CODE: ${{ steps.drill.outputs.drill_code }}
+        run: |
+          printf 'DR_AUDIT %s\n' "$(jq -nc \
+            --arg workflow "restore-drill-quarterly" \
+            --arg runId   "${{ github.run_id }}" \
+            --arg actor   "${{ github.actor }}" \
+            --arg event   "${{ github.event_name }}" \
+            --arg ts      "$(date -u -Iseconds)" \
+            --arg status  "${STATUS:-unknown}" \
+            --arg code    "${CODE:-?}" \
+            '{workflow:$workflow, runId:$runId, actor:$actor, event:$event, ts:$ts, status:$status, exitCode:$code}')"
+
+      - name: Fail job on drill failure
+        if: steps.gate.outputs.should_run == 'true' && steps.drill.outputs.drill_status != 'pass' && steps.drill.outputs.drill_status != 'completed'
+        run: |
+          echo "::error::Restore drill status was '${{ steps.drill.outputs.drill_status }}' (exit ${{ steps.drill.outputs.drill_code }}). See uploaded artifact."
+          exit 1
+
+      - name: Notify Discord on failure
+        if: steps.gate.outputs.should_run == 'true' && always() && job.status != 'success'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          set +e
+          if [[ -z "${DISCORD_WEBHOOK_URL:-}" ]]; then exit 0; fi
+          PAYLOAD=$(jq -nc \
+            --arg title "Restore drill quarterly: ${{ steps.drill.outputs.drill_status }}" \
+            --arg desc  "Exit ${{ steps.drill.outputs.drill_code }}. Last successful drill is the previous artifact in this workflow's history." \
+            --arg url   "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{embeds:[{title:$title, description:$desc, url:$url, color:15158332}]}')
+          curl -sS -H 'Content-Type: application/json' -d "${PAYLOAD}" "${DISCORD_WEBHOOK_URL}" >/dev/null || true
