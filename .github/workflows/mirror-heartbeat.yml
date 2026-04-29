@@ -24,6 +24,7 @@ jobs:
 
     steps:
       - name: Call mirror heartbeat endpoint
+        id: heartbeat
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
           PRODUCTION_BASE_URL: ${{ vars.PRODUCTION_BASE_URL }}
@@ -40,17 +41,47 @@ jobs:
             -H "Authorization: Bearer ${CRON_SECRET}" \
             "${URL}")
 
-          jq '{ok, mirrorCount, unhealthyCount, probes}' heartbeat-response.json 2>/dev/null || true
+          # Pretty-print the high-signal fields up front for log scanning.
+          jq '{ok, mirrorCount, unhealthyCount, durationMs, probes}' heartbeat-response.json 2>/dev/null || true
 
+          # The route now returns 200 on every authenticated call; the `ok`
+          # JSON field is the authoritative pass/fail signal. We still gate
+          # on HTTP code first so a true network/auth break gets surfaced.
           if [[ "${HTTP_CODE}" -lt 200 || "${HTTP_CODE}" -ge 300 ]]; then
             echo "::error::Mirror heartbeat failed with HTTP ${HTTP_CODE}"
             exit 1
           fi
 
+          # Hard fail when the registry resolved to zero mirrors — this is a
+          # silent class of failure the previous workflow did not catch.
+          MIRROR_COUNT=$(jq -r '.mirrorCount // 0' heartbeat-response.json)
+          if [[ "${MIRROR_COUNT}" -le 0 ]]; then
+            echo "::error::Mirror heartbeat reported mirrorCount=${MIRROR_COUNT}; FIREBASE_MIRROR_REGISTRY_JSON or legacy per-slot env vars are likely missing on production"
+            exit 1
+          fi
+
+          # Read the authoritative ok flag.
+          OK=$(jq -r '.ok' heartbeat-response.json)
+          if [[ "${OK}" != "true" ]]; then
+            UNHEALTHY=$(jq -r '.unhealthyCount // "?"' heartbeat-response.json)
+            echo "::error::Mirror heartbeat unhealthy: ok=${OK}, unhealthyCount=${UNHEALTHY}/${MIRROR_COUNT}"
+            jq -r '.probes[] | "  - \(.id) (\(.projectId // "no-project")): status=\(.status) lagMs=\(.lagMs // "null") attempts=\(.pollAttempts // 1) message=\(.message // "")"' heartbeat-response.json || true
+            exit 1
+          fi
+
+          # Surface a one-line summary for the audit step + alert payload.
+          SUMMARY=$(jq -rc '{ok, mirrorCount, unhealthyCount, durationMs, probes: [.probes[] | {id, projectId, status, lagMs, pollAttempts}]}' heartbeat-response.json)
+          {
+            echo "summary<<__EOF__"
+            echo "${SUMMARY}"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Emit audit record
         if: always()
         env:
           RESULT: ${{ job.status }}
+          SUMMARY: ${{ steps.heartbeat.outputs.summary }}
         run: |
           printf 'DR_AUDIT %s\n' "$(jq -nc \
             --arg workflow "mirror-heartbeat" \
@@ -59,19 +90,36 @@ jobs:
             --arg event   "${{ github.event_name }}" \
             --arg ts      "$(date -u -Iseconds)" \
             --arg result  "${RESULT}" \
-            '{workflow:$workflow, runId:$runId, actor:$actor, event:$event, ts:$ts, result:$result}')"
+            --arg summary "${SUMMARY:-}" \
+            '{workflow:$workflow, runId:$runId, actor:$actor, event:$event, ts:$ts, result:$result, summary:$summary}')"
 
       - name: Notify Discord on failure
         if: always() && job.status != 'success'
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SUMMARY: ${{ steps.heartbeat.outputs.summary }}
         run: |
           set +e
           if [[ -z "${DISCORD_WEBHOOK_URL:-}" ]]; then exit 0; fi
+          # Build a description that surfaces the actual unhealthy probes
+          # rather than a generic "failed" message; falls back to a hint when
+          # the heartbeat step itself never produced output (e.g. CRON_SECRET
+          # missing).
+          if [[ -n "${SUMMARY:-}" ]]; then
+            DESC=$(jq -nrc --argjson s "${SUMMARY}" '
+              "ok=" + ($s.ok | tostring) +
+              ", mirrorCount=" + ($s.mirrorCount | tostring) +
+              ", unhealthy=" + ($s.unhealthyCount | tostring) +
+              "\nprobes:\n" + ([$s.probes[] | "  - " + .id + " (" + (.projectId // "no-project") + "): " + .status + " lagMs=" + ((.lagMs // "null") | tostring)] | join("\n"))
+            ')
+          else
+            DESC="No response captured. Check CRON_SECRET, PRODUCTION_BASE_URL, and the Vercel logs."
+          fi
           PAYLOAD=$(jq -nc \
             --arg title "Mirror heartbeat failed" \
+            --arg desc  "${DESC}" \
             --arg url   "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            '{embeds:[{title:$title, url:$url, color:15158332}]}')
+            '{embeds:[{title:$title, description:$desc, url:$url, color:15158332}]}')
           curl -sS -H 'Content-Type: application/json' -d "${PAYLOAD}" "${DISCORD_WEBHOOK_URL}" >/dev/null || true
 
       - name: Notify Telegram on failure
@@ -79,10 +127,20 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUMMARY: ${{ steps.heartbeat.outputs.summary }}
         run: |
           set +e
           if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then exit 0; fi
-          MSG="Mirror heartbeat failed%0A%0AURL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [[ -n "${SUMMARY:-}" ]]; then
+            DETAIL=$(jq -nrc --argjson s "${SUMMARY}" '
+              "ok=" + ($s.ok | tostring) +
+              ", mirrors=" + ($s.mirrorCount | tostring) +
+              ", unhealthy=" + ($s.unhealthyCount | tostring)
+            ')
+          else
+            DETAIL="no response"
+          fi
+          MSG="Mirror heartbeat failed%0A${DETAIL}%0AURL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
             -d "text=${MSG}" \
