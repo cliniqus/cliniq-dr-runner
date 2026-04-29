@@ -4,9 +4,20 @@ name: mirror-heartbeat
 on:
   schedule:
     # Every 10 minutes, offset from the top of the hour to reduce GitHub
-    # scheduler crowding. This keeps the 15-minute mirror lag gate meaningful
-    # without depending on Vercel Cron.
-    - cron: '3,13,23,33,43,53 * * * *'
+    # scheduler crowding. This keeps the 15-minute mirror lag gate
+    # meaningful without depending on Vercel Cron.
+    #
+    # IMPORTANT: the offset MUST stay distinct from the Cloudflare Worker
+    # `cliniq-cron-worker` schedule (top-of-10-min slots: :00, :10, :20…).
+    # Pre-2026-04-29 we used :03,:13,:23… which only buffered 3 minutes
+    # against GitHub Actions scheduler drift; production observed a real
+    # collision (run 25105499876 fired at 11:10:36 while the Cloudflare
+    # 11:10:00 run was still polling, both writes raced on the same
+    # _mirror_health/heartbeat doc and each run reported the OTHER's value
+    # as 'stale'). Bumping to :05,:15,:25… doubles the buffer to 5 minutes
+    # and the convergence helper in lib/dr/heartbeat-convergence.ts
+    # absorbs the rare residual collision without paging.
+    - cron: '5,15,25,35,45,55 * * * *'
   workflow_dispatch: {}
 
 concurrency:
