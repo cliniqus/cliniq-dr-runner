@@ -1,64 +1,123 @@
 # cliniq-dr-runner
 
-Scheduled disaster-recovery automation for a private project.
+This public repository contains one thin GitHub-hosted runner Adapter. It has
+no backup rules and no scheduler.
 
-This repository contains **only GitHub Actions workflow definitions** —
-no application code, no business logic, no data. Its sole purpose is to
-run scheduled backup and verification jobs on GitHub-hosted runners,
-which clone separate private source repositories at execution time.
+Cloudflare sends a `data_fortress_job` repository dispatch. The workflow
+validates the payload, checks out the private website repository, installs its
+locked dependencies, and runs:
 
-## What this repo does
+```text
+npx tsx scripts/fortress/run-job.ts --job-id <id> --job-type <type> --nonce <nonce>
+```
 
-On scheduled intervals (UTC), a GitHub-hosted runner:
+The website `DataFortressCore` owns backup, verification, signing, and evidence
+behavior. The runner also contains the isolated-target restore Adapter. Restore
+execution remains fail-closed until the registered target configuration,
+short-lived offline key grant, provider permissions, and live restore gates are
+present and verified.
 
-1. Clones the private website and Firebase app repositories using a read-only token.
-2. Loads runtime credentials from GitHub Secrets (never committed).
-3. Executes backup / verification scripts against the project's
-   production data plane.
-4. Writes evidence artifacts to object storage.
-5. Destroys the runner VM.
+## Triggers
 
-All credentials, source code, customer data, and business logic live
-outside this repository. This repo is intentionally minimal so its
-public surface is just infrastructure-as-code YAML.
+- `repository_dispatch` event type `data_fortress_job`
+- Manual `workflow_dispatch`
 
-## Schedule
+There is deliberately no GitHub `schedule:` trigger. All automatic scheduling
+is owned by the Cloudflare coordinator.
 
-| Workflow | Cadence (UTC) | Purpose |
-| --- | --- | --- |
-| `backup.yml` | Daily 02:00 | Full backup + snapshot to off-site storage |
-| `mirror-heartbeat.yml` | Every 10 minutes | Probe real-time Firebase mirror lag without Vercel Cron |
-| `vault-sync.yml` | Daily 03:00 | Sync verification vault to off-site storage |
-| `mirror-auth-sync.yml` | Daily 03:15 | Sync recoverable Firebase Auth export into mirrors |
-| `dr-checks.yml` | Daily 06:00 | Run 6 read-only integrity checks, update evidence |
+Supported runner jobs:
 
-## Why public?
+- `backup`
+- `auth-continuity`
+- `media-parity`
+- `deep-verify`
+- `restore-drill`
+- `restore-plan`
+- `restore-execute`
+- `cutover-plan`
+- `local-copy-verify`
 
-GitHub-hosted Actions minutes are **unlimited on public repositories**
-for standard runners. The actual source code and data remain in a
-private repositories, cloned ephemerally at runtime. This gives us
-production-grade scheduled automation at zero cost without exposing
-any sensitive material.
+`restore-drill` and `restore-execute` request a short-lived generation-key
+grant from an offline operator, then restore only to a registered non-primary
+target. `cutover-plan` writes an operator checklist; it never changes DNS,
+Vercel traffic, OAuth, payments, notifications, or mobile configuration. No
+hosted runner contains the offline recovery decryption key.
 
-See [`SECURITY.md`](./SECURITY.md) for the full threat model and
-hardening design.
+Coordinator-created jobs carry an expiring, Ed25519-signed request in
+secondary R2. The runner verifies that request, conditionally claims its
+request-state object, and only then consumes the dispatch nonce. A coordinator
+dispatch failure revokes the pending state. Recovery jobs also acquire the
+secondary-R2 fenced restore lease. Three missed heartbeats abort its control
+signal and prevent a successful commit; the missing restore Adapter must check
+that signal before every mutating batch.
 
-## Maintenance
+`local-copy-verify` accepts only a pending receipt key and its SHA-256. The
+Core validates the receipt before publishing verified local-copy evidence.
 
-This repo is designed to be low-touch:
+## Repository configuration
 
-- **No dependencies to update** — the YAML workflows call a separate
-  repository whose own dependencies are managed there.
-- **Pinned actions** — every `uses:` entry is pinned to a specific
-  commit SHA; Dependabot proposes updates via PR.
-- **Annual rotation** — the `CLONE_TOKEN` fine-grained PAT has at
-  most a 1-year lifetime, must be rotated before expiry, and must have
-  read-only Contents access to both `SRC_REPO` and `FIREBASE_APP_REPO`.
+Variables used by the installed jobs:
 
-## Reporting security issues
+- `SRC_REPO`
+- `FIREBASE_PROJECT_ID`
+- `FIREBASE_STORAGE_BUCKET`
+- `R2_BUCKET_NAME`
+- `R2_BACKUP_BUCKET_NAME`
+- `GCS_STAGING_BUCKET`
+- `GCP_WORKLOAD_IDENTITY_PROVIDER`
+- `GCP_FORTRESS_SERVICE_ACCOUNT`
+- `GCP_FIREBASE_ADMIN_KEY_SECRET`
+- `FORTRESS_RECOVERY_TARGETS_JSON`
+- `FORTRESS_RECOVERY_TARGET_CONFIG_JSON`
+- `FORTRESS_SIGNING_KEY_ID`
+- `FORTRESS_ENCRYPTION_KEY_ID`
 
-See [`SECURITY.md`](./SECURITY.md).
+Secrets used by the installed jobs:
 
-## Licence
+- `SOURCE_REPOSITORY_TOKEN`, a read-only token scoped to `SRC_REPO`
+- `FIREBASE_ISOLATED_SERVICE_ACCOUNT_KEY`
+- `FIREBASE_RECOVERY_CANARY_API_KEY`
+- `FIREBASE_RECOVERY_CANARY_EMAIL`
+- `FIREBASE_RECOVERY_CANARY_PASSWORD`
+- `FIREBASE_AUTH_HASH_CONFIG_JSON`
+- Primary and secondary R2 credentials
+- `FORTRESS_JOB_SIGNING_PRIVATE_KEY`
+- `FORTRESS_SIGNING_PUBLIC_KEYS_JSON`
+- `FORTRESS_COORDINATOR_SIGNING_PUBLIC_KEYS_JSON`
+- `FORTRESS_APPROVAL_SIGNING_PUBLIC_KEYS_JSON`
+- `FORTRESS_RECOVERY_OPERATOR_PUBLIC_KEYS_JSON`
+- `R2_RECOVERY_ACCESS_KEY_ID`
+- `R2_RECOVERY_SECRET_ACCESS_KEY`
+- `FORTRESS_ENCRYPTION_PUBLIC_KEY`
+- `FORTRESS_RECOVERY_CAPSULE_JSON` (encrypted by the Core into each
+  generation before upload)
+- `FIREBASE_MIRROR_REGISTRY_JSON`
+- `FORTRESS_COST_MODEL_JSON`
+- `FIRESTORE_RULES_SNAPSHOT`
+- `FIREBASE_STORAGE_RULES_SNAPSHOT`
+- Optional alert-delivery credentials
 
-MIT — see [`LICENSE`](./LICENSE).
+`FORTRESS_RECOVERY_TARGET_CONFIG_JSON` maps each registered target to its
+Firebase Storage bucket, target GCS staging bucket, target R2 endpoint and
+bucket, target R2 credential environment names, target service-account
+environment name, Firebase API-key environment name, and recovery-canary
+credential environment names. Its target entries must not point at primary
+storage or staging, and the service-account
+`project_id` must exactly equal the registered recovery project. Each target
+also requires an HTTPS application smoke URL whose JSON identifies the same
+Firebase project and R2 bucket; a generic HTTP 200 is not accepted.
+`FORTRESS_RECOVERY_OPERATOR_PUBLIC_KEYS_JSON` trusts only public keys used to
+sign the one-time offline generation-key grant. The corresponding private keys
+and the offline recovery private key stay outside hosted systems.
+
+No local-copy path is configured on the hosted runner. Its temporary
+filesystem is never presented as a local backup.
+
+Google Cloud API authentication is provided by the pinned
+`google-github-actions/auth` Action with `id-token: write`. Firebase Admin SDK
+does not accept external-account credentials, so the workflow reads the
+Firebase Admin key from Secret Manager using the short-lived Google token,
+marks it as a masked runtime environment value, and never stores it as a
+GitHub repository secret.
+
+See `SECURITY.md` for the trust and secret-handling rules.

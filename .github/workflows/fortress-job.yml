@@ -1,0 +1,316 @@
+---
+name: fortress-job
+
+on:
+  repository_dispatch:
+    types: [data_fortress_job]
+  workflow_dispatch:
+    inputs:
+      jobType:
+        description: Data Fortress job to run
+        required: true
+        type: choice
+        options:
+          - backup
+          - auth-continuity
+          - media-parity
+          - deep-verify
+          - restore-drill
+          - restore-plan
+          - restore-execute
+          - cutover-plan
+          - local-copy-verify
+      jobId:
+        description: Optional caller job ID
+        required: false
+        type: string
+      planJobId:
+        description: Required signed plan job for restore execution or cutover
+        required: false
+        type: string
+      receiptKey:
+        description: Pending local-copy receipt object key
+        required: false
+        type: string
+      receiptSha256:
+        description: SHA-256 of the pending local-copy receipt
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: fortress-${{ github.event.client_payload.jobType || inputs.jobType }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: Run ${{ github.event.client_payload.jobType || inputs.jobType }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Validate and normalize dispatch
+        id: dispatch
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_JOB_ID: ${{ github.event.client_payload.jobId }}
+          DISPATCH_JOB_TYPE: ${{ github.event.client_payload.jobType }}
+          DISPATCH_SCHEMA_VERSION: ${{ github.event.client_payload.schemaVersion }}
+          DISPATCH_NONCE: ${{ github.event.client_payload.nonce }}
+          DISPATCH_SCHEDULED_FOR: ${{ github.event.client_payload.scheduledFor }}
+          MANUAL_JOB_ID: ${{ inputs.jobId }}
+          MANUAL_JOB_TYPE: ${{ inputs.jobType }}
+          MANUAL_PLAN_JOB_ID: ${{ inputs.planJobId }}
+          DISPATCH_PLAN_JOB_ID: ${{ github.event.client_payload.planJobId }}
+          DISPATCH_RECEIPT_KEY: ${{ github.event.client_payload.receiptKey }}
+          DISPATCH_RECEIPT_SHA256: ${{ github.event.client_payload.receiptSha256 }}
+          MANUAL_RECEIPT_KEY: ${{ inputs.receiptKey }}
+          MANUAL_RECEIPT_SHA256: ${{ inputs.receiptSha256 }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "repository_dispatch" ]]; then
+            JOB_ID="${DISPATCH_JOB_ID}"
+            JOB_TYPE="${DISPATCH_JOB_TYPE}"
+            SCHEMA_VERSION="${DISPATCH_SCHEMA_VERSION}"
+            NONCE="${DISPATCH_NONCE}"
+            SCHEDULED_FOR="${DISPATCH_SCHEDULED_FOR}"
+            PLAN_JOB_ID="${DISPATCH_PLAN_JOB_ID}"
+            RECEIPT_KEY="${DISPATCH_RECEIPT_KEY}"
+            RECEIPT_SHA256="${DISPATCH_RECEIPT_SHA256}"
+          else
+            JOB_ID="${MANUAL_JOB_ID:-manual-${GITHUB_RUN_ID}}"
+            JOB_TYPE="${MANUAL_JOB_TYPE}"
+            SCHEMA_VERSION="1"
+            NONCE="$(openssl rand -hex 16)"
+            SCHEDULED_FOR="$(date -u -Iseconds)"
+            PLAN_JOB_ID="${MANUAL_PLAN_JOB_ID}"
+            RECEIPT_KEY="${MANUAL_RECEIPT_KEY}"
+            RECEIPT_SHA256="${MANUAL_RECEIPT_SHA256}"
+          fi
+
+          case "${JOB_TYPE}" in
+            backup|auth-continuity|media-parity|deep-verify|restore-drill|restore-plan|restore-execute|cutover-plan|local-copy-verify) ;;
+            *) echo "::error::Unsupported job type"; exit 1 ;;
+          esac
+          [[ "${SCHEMA_VERSION}" == "1" ]] || {
+            echo "::error::Unsupported dispatch schema"; exit 1;
+          }
+          [[ "${JOB_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$ ]] || {
+            echo "::error::Invalid job ID"; exit 1;
+          }
+          [[ "${NONCE}" =~ ^[A-Za-z0-9_-]{16,128}$ ]] || {
+            echo "::error::Invalid dispatch nonce"; exit 1;
+          }
+          date -u -d "${SCHEDULED_FOR}" >/dev/null 2>&1 || {
+            echo "::error::Invalid scheduledFor timestamp"; exit 1;
+          }
+          if [[ "${JOB_TYPE}" == "restore-execute" || "${JOB_TYPE}" == "cutover-plan" ]]; then
+            [[ "${PLAN_JOB_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$ ]] || {
+              echo "::error::${JOB_TYPE} requires a valid signed plan job ID"; exit 1;
+            }
+          elif [[ -n "${PLAN_JOB_ID}" ]]; then
+            [[ "${PLAN_JOB_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$ ]] || {
+              echo "::error::Invalid plan job ID"; exit 1;
+            }
+          fi
+          if [[ "${JOB_TYPE}" == "local-copy-verify" ]]; then
+            [[ "${RECEIPT_KEY}" =~ ^firebase/local-copy-receipts/pending/(d-full|g-critical)/[0-9A-HJKMNP-TV-Z]{26}\.json$ ]] || {
+              echo "::error::local-copy-verify requires a safe pending receipt key"; exit 1;
+            }
+            [[ "${RECEIPT_SHA256}" =~ ^[a-f0-9]{64}$ ]] || {
+              echo "::error::local-copy-verify requires a receipt SHA-256"; exit 1;
+            }
+          elif [[ -n "${RECEIPT_KEY}" || -n "${RECEIPT_SHA256}" ]]; then
+            echo "::error::Receipt fields are only valid for local-copy-verify"
+            exit 1
+          fi
+
+          {
+            echo "FORTRESS_JOB_ID=${JOB_ID}"
+            echo "FORTRESS_JOB_TYPE=${JOB_TYPE}"
+            echo "FORTRESS_SCHEMA_VERSION=${SCHEMA_VERSION}"
+            echo "FORTRESS_DISPATCH_NONCE=${NONCE}"
+            echo "FORTRESS_SCHEDULED_FOR=${SCHEDULED_FOR}"
+            echo "FORTRESS_PLAN_JOB_ID=${PLAN_JOB_ID}"
+            echo "FORTRESS_RECEIPT_KEY=${RECEIPT_KEY}"
+            echo "FORTRESS_RECEIPT_SHA256=${RECEIPT_SHA256}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Checkout website Core
+        uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.1
+        with:
+          repository: ${{ vars.SRC_REPO }}
+          token: ${{ secrets.SOURCE_REPOSITORY_TOKEN }}
+          path: website
+          persist-credentials: false
+
+      - name: Setup Node 20
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.1
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Authenticate to Google Cloud with workload identity
+        id: google-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ vars.FIREBASE_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_FORTRESS_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+          export_environment_variables: true
+          token_format: access_token
+          access_token_lifetime: 300s
+
+      - name: Fetch Firebase Admin credential from Secret Manager
+        env:
+          ACCESS_TOKEN: ${{ steps.google-auth.outputs.access_token }}
+          PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+          SECRET_NAME: ${{ vars.GCP_FIREBASE_ADMIN_KEY_SECRET }}
+        run: |
+          set -euo pipefail
+          [[ -n "${SECRET_NAME:-}" ]] || {
+            echo "::error::GCP_FIREBASE_ADMIN_KEY_SECRET is not configured"; exit 1;
+          }
+          payload="$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            "https://secretmanager.googleapis.com/v1/projects/${PROJECT_ID}/secrets/${SECRET_NAME}/versions/latest:access" \
+            | jq -er '.payload.data')"
+          firebase_key="$(printf '%s' "${payload}" | base64 --decode | jq -c .)"
+          [[ -n "${firebase_key}" ]] || {
+            echo "::error::Secret Manager returned an empty Firebase Admin credential"; exit 1;
+          }
+          echo "::add-mask::${firebase_key}"
+          printf 'FIREBASE_SERVICE_ACCOUNT_KEY=%s\n' "${firebase_key}" >> "${GITHUB_ENV}"
+
+      - name: Verify runner configuration
+        env:
+          SOURCE_REPOSITORY: ${{ vars.SRC_REPO }}
+          SOURCE_REPOSITORY_TOKEN: ${{ secrets.SOURCE_REPOSITORY_TOKEN }}
+          SIGNING_PRIVATE_KEY: ${{ secrets.FORTRESS_JOB_SIGNING_PRIVATE_KEY }}
+          SIGNING_KEY_ID: ${{ vars.FORTRESS_SIGNING_KEY_ID }}
+          COORDINATOR_PUBLIC_KEYS: ${{ secrets.FORTRESS_COORDINATOR_SIGNING_PUBLIC_KEYS_JSON }}
+          WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          FORTRESS_SERVICE_ACCOUNT: ${{ vars.GCP_FORTRESS_SERVICE_ACCOUNT }}
+          FIREBASE_ADMIN_KEY_SECRET: ${{ vars.GCP_FIREBASE_ADMIN_KEY_SECRET }}
+        run: |
+          set -euo pipefail
+          [[ -n "${SOURCE_REPOSITORY:-}" ]] || {
+            echo "::error::SRC_REPO is not configured"; exit 1;
+          }
+          [[ -n "${SOURCE_REPOSITORY_TOKEN:-}" ]] || {
+            echo "::error::SOURCE_REPOSITORY_TOKEN is not configured"; exit 1;
+          }
+          [[ -n "${SIGNING_PRIVATE_KEY:-}" ]] || {
+            echo "::error::FORTRESS_JOB_SIGNING_PRIVATE_KEY is not configured"; exit 1;
+          }
+          [[ -n "${SIGNING_KEY_ID:-}" ]] || {
+            echo "::error::FORTRESS_SIGNING_KEY_ID is not configured"; exit 1;
+          }
+          [[ -n "${COORDINATOR_PUBLIC_KEYS:-}" ]] || {
+            echo "::error::FORTRESS_COORDINATOR_SIGNING_PUBLIC_KEYS_JSON is not configured"; exit 1;
+          }
+          [[ -n "${WORKLOAD_IDENTITY_PROVIDER:-}" ]] || {
+            echo "::error::GCP_WORKLOAD_IDENTITY_PROVIDER is not configured"; exit 1;
+          }
+          [[ -n "${FORTRESS_SERVICE_ACCOUNT:-}" ]] || {
+            echo "::error::GCP_FORTRESS_SERVICE_ACCOUNT is not configured"; exit 1;
+          }
+          [[ -n "${FIREBASE_ADMIN_KEY_SECRET:-}" ]] || {
+            echo "::error::GCP_FIREBASE_ADMIN_KEY_SECRET is not configured"; exit 1;
+          }
+          [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] || {
+            echo "::error::Workload identity did not create application credentials"; exit 1;
+          }
+          [[ -n "${FIREBASE_SERVICE_ACCOUNT_KEY:-}" ]] || {
+            echo "::error::Firebase Admin credential was not fetched"; exit 1;
+          }
+          test -f website/package-lock.json
+          test -f website/scripts/fortress/run-job.ts || {
+            echo "::error::The website Core runner Adapter is missing"; exit 1;
+          }
+
+      - name: Install locked dependencies
+        working-directory: website
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run Data Fortress Core job
+        working-directory: website
+        env:
+          FIREBASE_STORAGE_BUCKET: ${{ vars.FIREBASE_STORAGE_BUCKET }}
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+          FIREBASE_AUTH_HASH_CONFIG_JSON: ${{ secrets.FIREBASE_AUTH_HASH_CONFIG_JSON }}
+          FIREBASE_ISOLATED_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_ISOLATED_SERVICE_ACCOUNT_KEY }}
+          FIREBASE_ISOLATED_PROJECT_ID: ${{ vars.FIREBASE_ISOLATED_PROJECT_ID }}
+          FIREBASE_RECOVERY_CANARY_API_KEY: ${{ secrets.FIREBASE_RECOVERY_CANARY_API_KEY }}
+          FIREBASE_RECOVERY_CANARY_EMAIL: ${{ secrets.FIREBASE_RECOVERY_CANARY_EMAIL }}
+          FIREBASE_RECOVERY_CANARY_PASSWORD: ${{ secrets.FIREBASE_RECOVERY_CANARY_PASSWORD }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_BACKUP_ENDPOINT: ${{ secrets.R2_BACKUP_ENDPOINT }}
+          R2_BACKUP_ACCESS_KEY_ID: ${{ secrets.R2_BACKUP_ACCESS_KEY_ID }}
+          R2_BACKUP_SECRET_ACCESS_KEY: ${{ secrets.R2_BACKUP_SECRET_ACCESS_KEY }}
+          R2_BACKUP_BUCKET_NAME: ${{ vars.R2_BACKUP_BUCKET_NAME }}
+          R2_RECOVERY_ACCESS_KEY_ID: ${{ secrets.R2_RECOVERY_ACCESS_KEY_ID }}
+          R2_RECOVERY_SECRET_ACCESS_KEY: ${{ secrets.R2_RECOVERY_SECRET_ACCESS_KEY }}
+          R2_ISOLATED_BUCKET_NAME: ${{ vars.R2_ISOLATED_BUCKET_NAME }}
+          FORTRESS_RECOVERY_TARGETS_JSON: ${{ vars.FORTRESS_RECOVERY_TARGETS_JSON }}
+          FORTRESS_RECOVERY_TARGET_CONFIG_JSON: ${{ secrets.FORTRESS_RECOVERY_TARGET_CONFIG_JSON }}
+          FORTRESS_RECOVERY_OPERATOR_PUBLIC_KEYS_JSON: ${{ secrets.FORTRESS_RECOVERY_OPERATOR_PUBLIC_KEYS_JSON }}
+          FIREBASE_MIRROR_REGISTRY_JSON: ${{ secrets.FIREBASE_MIRROR_REGISTRY_JSON }}
+          FORTRESS_JOB_SIGNING_PRIVATE_KEY: ${{ secrets.FORTRESS_JOB_SIGNING_PRIVATE_KEY }}
+          FORTRESS_SIGNING_KEY_ID: ${{ vars.FORTRESS_SIGNING_KEY_ID }}
+          FORTRESS_SIGNING_PUBLIC_KEYS_JSON: ${{ secrets.FORTRESS_SIGNING_PUBLIC_KEYS_JSON }}
+          FORTRESS_COORDINATOR_SIGNING_PUBLIC_KEYS_JSON: ${{ secrets.FORTRESS_COORDINATOR_SIGNING_PUBLIC_KEYS_JSON }}
+          FORTRESS_APPROVAL_SIGNING_PUBLIC_KEYS_JSON: ${{ secrets.FORTRESS_APPROVAL_SIGNING_PUBLIC_KEYS_JSON }}
+          FORTRESS_ENCRYPTION_PUBLIC_KEY: ${{ secrets.FORTRESS_ENCRYPTION_PUBLIC_KEY }}
+          FORTRESS_ENCRYPTION_KEY_ID: ${{ vars.FORTRESS_ENCRYPTION_KEY_ID }}
+          FORTRESS_RECOVERY_CAPSULE_JSON: ${{ secrets.FORTRESS_RECOVERY_CAPSULE_JSON }}
+          FORTRESS_COST_MODEL_JSON: ${{ secrets.FORTRESS_COST_MODEL_JSON }}
+          FIRESTORE_RULES_SNAPSHOT: ${{ secrets.FIRESTORE_RULES_SNAPSHOT }}
+          FIREBASE_STORAGE_RULES_SNAPSHOT: ${{ secrets.FIREBASE_STORAGE_RULES_SNAPSHOT }}
+          GCS_STAGING_BUCKET: ${{ vars.GCS_STAGING_BUCKET }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          ARGS=(
+            --job-id "${FORTRESS_JOB_ID}"
+            --job-type "${FORTRESS_JOB_TYPE}"
+            --nonce "${FORTRESS_DISPATCH_NONCE}"
+          )
+          if [[ -n "${FORTRESS_PLAN_JOB_ID}" ]]; then
+            ARGS+=(--plan-job-id "${FORTRESS_PLAN_JOB_ID}")
+          fi
+          if [[ -n "${FORTRESS_RECEIPT_KEY}" ]]; then
+            ARGS+=(
+              --receipt-key "${FORTRESS_RECEIPT_KEY}"
+              --receipt-sha256 "${FORTRESS_RECEIPT_SHA256}"
+            )
+          fi
+          npx tsx scripts/fortress/run-job.ts "${ARGS[@]}"
+
+      - name: Emit runner audit line
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+        run: |
+          jq -nc \
+            --arg event "fortress-runner-finished" \
+            --arg jobId "${FORTRESS_JOB_ID:-unknown}" \
+            --arg jobType "${FORTRESS_JOB_TYPE:-unknown}" \
+            --arg runId "${GITHUB_RUN_ID}" \
+            --arg result "${RESULT}" \
+            --arg timestamp "$(date -u -Iseconds)" \
+            '{event:$event,jobId:$jobId,jobType:$jobType,runId:$runId,result:$result,timestamp:$timestamp}'
+
+      - name: Scrub checked-out source
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE}/website"
