@@ -35,7 +35,6 @@ Supported runner jobs:
 - `restore-plan`
 - `restore-execute`
 - `cutover-plan`
-- `local-copy-verify`
 
 `restore-drill` and `restore-execute` request a short-lived generation-key
 grant from an offline operator, then restore only to a registered non-primary
@@ -51,8 +50,11 @@ secondary-R2 fenced restore lease. Three missed heartbeats abort its control
 signal and prevent a successful commit; the missing restore Adapter must check
 that signal before every mutating batch.
 
-`local-copy-verify` accepts only a pending receipt key and its SHA-256. The
-Core validates the receipt before publishing verified local-copy evidence.
+The local off-cloud copy is no longer a runner job. It is pulled by a launchd
+agent on the operator's Mac (`scripts/fortress/install-local-sync-agent.sh` in
+the website repo) and reports its freshness by publishing a receipt to
+`local-copy-mirror/latest.json` in secondary R2, which the health check and the
+admin dashboard both read.
 
 ## Repository configuration
 

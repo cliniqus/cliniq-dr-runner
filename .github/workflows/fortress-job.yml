@@ -19,21 +19,12 @@ on:
           - restore-plan
           - restore-execute
           - cutover-plan
-          - local-copy-verify
       jobId:
         description: Optional caller job ID
         required: false
         type: string
       planJobId:
         description: Required signed plan job for restore execution or cutover
-        required: false
-        type: string
-      receiptKey:
-        description: Pending local-copy receipt object key
-        required: false
-        type: string
-      receiptSha256:
-        description: SHA-256 of the pending local-copy receipt
         required: false
         type: string
 
@@ -65,10 +56,6 @@ jobs:
           MANUAL_JOB_TYPE: ${{ inputs.jobType }}
           MANUAL_PLAN_JOB_ID: ${{ inputs.planJobId }}
           DISPATCH_PLAN_JOB_ID: ${{ github.event.client_payload.planJobId }}
-          DISPATCH_RECEIPT_KEY: ${{ github.event.client_payload.receiptKey }}
-          DISPATCH_RECEIPT_SHA256: ${{ github.event.client_payload.receiptSha256 }}
-          MANUAL_RECEIPT_KEY: ${{ inputs.receiptKey }}
-          MANUAL_RECEIPT_SHA256: ${{ inputs.receiptSha256 }}
         run: |
           set -euo pipefail
           if [[ "${EVENT_NAME}" == "repository_dispatch" ]]; then
@@ -78,8 +65,6 @@ jobs:
             NONCE="${DISPATCH_NONCE}"
             SCHEDULED_FOR="${DISPATCH_SCHEDULED_FOR}"
             PLAN_JOB_ID="${DISPATCH_PLAN_JOB_ID}"
-            RECEIPT_KEY="${DISPATCH_RECEIPT_KEY}"
-            RECEIPT_SHA256="${DISPATCH_RECEIPT_SHA256}"
           else
             JOB_ID="${MANUAL_JOB_ID:-manual-${GITHUB_RUN_ID}}"
             JOB_TYPE="${MANUAL_JOB_TYPE}"
@@ -87,12 +72,10 @@ jobs:
             NONCE="$(openssl rand -hex 16)"
             SCHEDULED_FOR="$(date -u -Iseconds)"
             PLAN_JOB_ID="${MANUAL_PLAN_JOB_ID}"
-            RECEIPT_KEY="${MANUAL_RECEIPT_KEY}"
-            RECEIPT_SHA256="${MANUAL_RECEIPT_SHA256}"
           fi
 
           case "${JOB_TYPE}" in
-            backup|auth-continuity|media-parity|deep-verify|restore-drill|restore-plan|restore-execute|cutover-plan|local-copy-verify) ;;
+            backup|auth-continuity|media-parity|deep-verify|restore-drill|restore-plan|restore-execute|cutover-plan) ;;
             *) echo "::error::Unsupported job type"; exit 1 ;;
           esac
           [[ "${SCHEMA_VERSION}" == "1" ]] || {
@@ -116,17 +99,6 @@ jobs:
               echo "::error::Invalid plan job ID"; exit 1;
             }
           fi
-          if [[ "${JOB_TYPE}" == "local-copy-verify" ]]; then
-            [[ "${RECEIPT_KEY}" =~ ^firebase/local-copy-receipts/pending/(d-full|g-critical)/[0-9A-HJKMNP-TV-Z]{26}\.json$ ]] || {
-              echo "::error::local-copy-verify requires a safe pending receipt key"; exit 1;
-            }
-            [[ "${RECEIPT_SHA256}" =~ ^[a-f0-9]{64}$ ]] || {
-              echo "::error::local-copy-verify requires a receipt SHA-256"; exit 1;
-            }
-          elif [[ -n "${RECEIPT_KEY}" || -n "${RECEIPT_SHA256}" ]]; then
-            echo "::error::Receipt fields are only valid for local-copy-verify"
-            exit 1
-          fi
 
           {
             echo "FORTRESS_JOB_ID=${JOB_ID}"
@@ -135,8 +107,6 @@ jobs:
             echo "FORTRESS_DISPATCH_NONCE=${NONCE}"
             echo "FORTRESS_SCHEDULED_FOR=${SCHEDULED_FOR}"
             echo "FORTRESS_PLAN_JOB_ID=${PLAN_JOB_ID}"
-            echo "FORTRESS_RECEIPT_KEY=${RECEIPT_KEY}"
-            echo "FORTRESS_RECEIPT_SHA256=${RECEIPT_SHA256}"
           } >> "${GITHUB_ENV}"
 
       - name: Checkout website Core
@@ -291,8 +261,6 @@ jobs:
           fi
           if [[ -n "${FORTRESS_RECEIPT_KEY}" ]]; then
             ARGS+=(
-              --receipt-key "${FORTRESS_RECEIPT_KEY}"
-              --receipt-sha256 "${FORTRESS_RECEIPT_SHA256}"
             )
           fi
           npx tsx scripts/fortress/run-job.ts "${ARGS[@]}"
