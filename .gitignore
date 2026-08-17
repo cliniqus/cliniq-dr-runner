@@ -24,3 +24,6 @@ gha-creds-*.json
 .idea/
 *.swp
 *.swo
+
+# Isolated implementation worktrees.
+.worktrees/
